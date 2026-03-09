@@ -26,6 +26,7 @@ const processedMessages = new WeakSet();
 let enabled = true;
 let enableCSS = true;
 let enableJS = true;
+let autoRenderHTML = true; // 自動渲染 ```html 程式碼塊
 
 // ============================================================
 //  CSS Scoping
@@ -429,6 +430,83 @@ function processIframeSandbox(pre, mesElement) {
 }
 
 // ============================================================
+//  HTML Render（完整 HTML 頁面渲染到 iframe）
+//  用於 ```html-render
+// ============================================================
+function injectResizeReporter(htmlCode) {
+    // 在 </body> 或末尾注入高度回報腳本
+    const script = `
+<script>
+(function() {
+  function reportHeight() {
+    var h = Math.max(
+      document.body.scrollHeight, document.body.offsetHeight,
+      document.documentElement.scrollHeight, document.documentElement.offsetHeight
+    );
+    window.parent.postMessage({ type: 'cr-resize', height: h }, '*');
+  }
+  if (window.ResizeObserver) {
+    new ResizeObserver(reportHeight).observe(document.body);
+  }
+  window.addEventListener('load', function() {
+    reportHeight();
+    setTimeout(reportHeight, 100);
+    setTimeout(reportHeight, 500);
+    setTimeout(reportHeight, 1500);
+  });
+  reportHeight();
+  setTimeout(reportHeight, 50);
+})();
+<\/script>`;
+
+    // 嘗試插入在 </body> 前面
+    if (htmlCode.includes('</body>')) {
+        return htmlCode.replace('</body>', script + '\n</body>');
+    }
+    // 嘗試插入在 </html> 前面
+    if (htmlCode.includes('</html>')) {
+        return htmlCode.replace('</html>', script + '\n</html>');
+    }
+    // 都沒有就直接附加在末尾
+    return htmlCode + script;
+}
+
+function processHTMLRender(pre, mesElement) {
+    const codeBlock = pre.querySelector('code');
+    const htmlCode = injectResizeReporter(codeBlock.textContent);
+    const blob = new Blob([htmlCode], { type: 'text/html' });
+    const blobURL = URL.createObjectURL(blob);
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'cr-html-wrapper';
+
+    const iframe = document.createElement('iframe');
+    iframe.src = blobURL;
+    iframe.sandbox = 'allow-scripts';
+    iframe.className = 'cr-html-iframe';
+    iframe.style.width = '100%';
+    iframe.style.height = '200px'; // 初始高度較大，因為是完整頁面
+    iframe.style.border = 'none';
+    iframe.style.display = 'block';
+    iframe.style.borderRadius = '8px';
+    iframe.setAttribute('loading', 'lazy');
+
+    const resizeHandler = (event) => {
+        if (event.source === iframe.contentWindow && event.data?.type === 'cr-resize') {
+            const newHeight = Math.min(Math.max(event.data.height + 2, 60), 2000);
+            iframe.style.height = newHeight + 'px';
+        }
+    };
+    window.addEventListener('message', resizeHandler);
+
+    iframe.addEventListener('load', () => URL.revokeObjectURL(blobURL));
+
+    wrapper.appendChild(iframe);
+    pre.replaceWith(wrapper);
+    log(`HTML rendered in message #${mesElement.getAttribute('mesid')}`);
+}
+
+// ============================================================
 //  JS Processing
 // ============================================================
 function processMessageJS(mesElement) {
@@ -458,6 +536,20 @@ function processMessageJS(mesElement) {
         if (!pre || pre.dataset.crProcessed) return;
         pre.dataset.crProcessed = 'true';
         processIframeSandbox(pre, mesElement);
+    });
+
+    // ```html-render → 完整 HTML 頁面渲染到 iframe
+    // 如果 autoRenderHTML 開啟，也渲染普通的 ```html
+    let htmlSelector = 'code.language-html-render, code.language-render-html, code.language-htmlrender';
+    if (autoRenderHTML) {
+        htmlSelector += ', code.language-html';
+    }
+    const htmlBlocks = mesText.querySelectorAll(htmlSelector);
+    htmlBlocks.forEach((codeBlock) => {
+        const pre = codeBlock.closest('pre');
+        if (!pre || pre.dataset.crProcessed) return;
+        pre.dataset.crProcessed = 'true';
+        processHTMLRender(pre, mesElement);
     });
 }
 
@@ -530,13 +622,14 @@ function loadSettings() {
             enabled = s.enabled ?? true;
             enableCSS = s.enableCSS ?? true;
             enableJS = s.enableJS ?? true;
+            autoRenderHTML = s.autoRenderHTML ?? true;
         } catch (e) { /* ignore */ }
     }
 }
 
 function saveSettings() {
     localStorage.setItem(`${MODULE_NAME}_settings`, JSON.stringify({
-        enabled, enableCSS, enableJS,
+        enabled, enableCSS, enableJS, autoRenderHTML,
     }));
 }
 
@@ -562,18 +655,10 @@ function createSettingsUI() {
                         <input type="checkbox" id="cr_enable_js" ${enableJS ? 'checked' : ''}>
                         <span>JS 執行</span>
                     </label>
-                    <hr>
-                    <small class="cr-help-text">
-                        <b>CSS：</b><br>
-                        &lt;style&gt; 標籤 → 自動 scope 到該訊息<br>
-                        <code>\`\`\`css-render</code> → 注入 scoped CSS<br><br>
-                        <b>JS（兩種模式）：</b><br>
-                        <code>\`\`\`js-render</code> → 操作訊息內 DOM<br>
-                        <small style="opacity:0.7; margin-left:8px;">可加事件監聽、做動畫翻頁等</small><br>
-                        <small style="opacity:0.7; margin-left:8px;">已封鎖 fetch / XHR / localStorage / eval</small><br><br>
-                        <code>\`\`\`js-sandbox</code> → iframe 完全隔離<br>
-                        <small style="opacity:0.7; margin-left:8px;">碰不到頁面，最安全</small>
-                    </small>
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="cr_auto_html" ${autoRenderHTML ? 'checked' : ''}>
+                        <span>自動渲染 \`\`\`html（不只 html-render）</span>
+                    </label>
                 </div>
             </div>
         </div>
@@ -592,6 +677,10 @@ function createSettingsUI() {
     });
     $('#cr_enable_js').on('change', function () {
         enableJS = this.checked;
+        saveSettings();
+    });
+    $('#cr_auto_html').on('change', function () {
+        autoRenderHTML = this.checked;
         saveSettings();
     });
 }
