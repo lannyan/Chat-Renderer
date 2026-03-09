@@ -434,17 +434,44 @@ function processIframeSandbox(pre, mesElement) {
 //  用於 ```html-render
 // ============================================================
 function injectResizeReporter(htmlCode) {
-    // 在 </body> 或末尾注入高度回報腳本
+    // 修正 CSS：避免 vh/vw 在 iframe 中造成無限循環
+    // 覆寫 html/body 的 viewport-relative 高度為自適應
+    const fixCSS = `
+<style data-cr-fix>
+  html, body {
+    min-height: auto !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+</style>`;
+
     const script = `
 <script>
 (function() {
+  function getContentHeight() {
+    // 精確計算實際內容高度（不含 vh 導致的膨脹）
+    var children = document.body.children;
+    var maxBottom = 0;
+    for (var i = 0; i < children.length; i++) {
+      var el = children[i];
+      if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
+      var rect = el.getBoundingClientRect();
+      var style = getComputedStyle(el);
+      var mb = parseFloat(style.marginBottom) || 0;
+      var bottom = rect.top + rect.height + mb;
+      if (bottom > maxBottom) maxBottom = bottom;
+    }
+    // 加上 body padding
+    var bodyStyle = getComputedStyle(document.body);
+    var pt = parseFloat(bodyStyle.paddingTop) || 0;
+    return Math.ceil(maxBottom + pt + 10);
+  }
+
   function reportHeight() {
-    var h = Math.max(
-      document.body.scrollHeight, document.body.offsetHeight,
-      document.documentElement.scrollHeight, document.documentElement.offsetHeight
-    );
+    var h = Math.max(getContentHeight(), 60);
     window.parent.postMessage({ type: 'cr-resize', height: h }, '*');
   }
+
   if (window.ResizeObserver) {
     new ResizeObserver(reportHeight).observe(document.body);
   }
@@ -456,19 +483,28 @@ function injectResizeReporter(htmlCode) {
   });
   reportHeight();
   setTimeout(reportHeight, 50);
+  setTimeout(reportHeight, 300);
 })();
 <\/script>`;
 
-    // 嘗試插入在 </body> 前面
-    if (htmlCode.includes('</body>')) {
-        return htmlCode.replace('</body>', script + '\n</body>');
+    // 注入修正 CSS 到 <head> 裡
+    let result = htmlCode;
+    if (result.includes('</head>')) {
+        result = result.replace('</head>', fixCSS + '\n</head>');
+    } else if (result.includes('<body')) {
+        result = result.replace('<body', fixCSS + '\n<body');
+    } else {
+        result = fixCSS + '\n' + result;
     }
-    // 嘗試插入在 </html> 前面
-    if (htmlCode.includes('</html>')) {
-        return htmlCode.replace('</html>', script + '\n</html>');
+
+    // 注入 resize reporter 腳本
+    if (result.includes('</body>')) {
+        return result.replace('</body>', script + '\n</body>');
     }
-    // 都沒有就直接附加在末尾
-    return htmlCode + script;
+    if (result.includes('</html>')) {
+        return result.replace('</html>', script + '\n</html>');
+    }
+    return result + script;
 }
 
 function processHTMLRender(pre, mesElement) {
