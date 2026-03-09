@@ -2,9 +2,14 @@
  * Chat Renderer — 在 ST 聊天訊息中安全渲染 CSS 與 JS
  *
  * CSS: 自動將 <style> 標籤作用域限定在該訊息內，防止樣式外洩
- * JS:  將 ```js-render 程式碼塊放入 sandbox iframe 中安全執行
+ * JS:  ```js-render  → 直接操作訊息 DOM（有安全防護）
+ *      ```js-sandbox → 在 iframe 沙盒中執行（完全隔離）
  *
- * 不存取 API key、不修改 ST 核心設定、不發送任何外部請求
+ * 安全措施：
+ *   - JS 執行時遮蔽危險 API（fetch, XMLHttpRequest, WebSocket, eval 等）
+ *   - JS 作用域限定在該訊息的 .mes_text 內
+ *   - 不可存取 ST 核心物件、API key、localStorage
+ *   - CSS 自動 scope 到訊息內
  */
 
 const MODULE_NAME = 'chat-renderer';
@@ -24,11 +29,8 @@ let enableJS = true;
 
 // ============================================================
 //  CSS Scoping
-//  把訊息中的 <style> 內容加上 selector 前綴，限制在該訊息內
 // ============================================================
 function scopeCSS(cssText, scopeSelector) {
-    // 簡易 scope: 在每條規則前面加上 scopeSelector
-    // 處理 @media / @keyframes 等 at-rules 時保留原樣內層
     const lines = cssText.split('\n');
     let result = '';
     let insideAtRule = 0;
@@ -37,7 +39,6 @@ function scopeCSS(cssText, scopeSelector) {
     for (const line of lines) {
         const trimmed = line.trim();
 
-        // 偵測 @keyframes — 內部不 scope
         if (/^@keyframes\s/i.test(trimmed) || /^@-webkit-keyframes\s/i.test(trimmed)) {
             insideKeyframes = true;
             result += line + '\n';
@@ -45,14 +46,12 @@ function scopeCSS(cssText, scopeSelector) {
             continue;
         }
 
-        // 偵測其他 at-rule (如 @media)
         if (/^@/.test(trimmed) && !insideKeyframes) {
             result += line + '\n';
             if (trimmed.includes('{')) insideAtRule++;
             continue;
         }
 
-        // 追蹤大括號層級
         const opens = (line.match(/{/g) || []).length;
         const closes = (line.match(/}/g) || []).length;
 
@@ -66,17 +65,14 @@ function scopeCSS(cssText, scopeSelector) {
             continue;
         }
 
-        // 一般 selector 行 — 前面加 scope
         if (trimmed && !trimmed.startsWith('}') && !trimmed.startsWith('/*') &&
             trimmed.includes('{') && !trimmed.startsWith('@')) {
             const idx = line.indexOf('{');
             const selectorPart = line.substring(0, idx);
             const rest = line.substring(idx);
-            // 處理多重 selector (逗號分隔)
             const scoped = selectorPart.split(',').map(sel => {
                 sel = sel.trim();
                 if (!sel) return sel;
-                // :root 和 body 替換為 scope selector
                 if (sel === ':root' || sel === 'body' || sel === 'html') {
                     return scopeSelector;
                 }
@@ -104,7 +100,7 @@ function processMessageCSS(mesElement) {
     const scopeSelector = `.mes[mesid="${mesId}"] .mes_text`;
 
     styleTags.forEach((styleTag) => {
-        if (styleTag.dataset.crScoped) return; // 已處理
+        if (styleTag.dataset.crScoped) return;
         const original = styleTag.textContent;
         const scoped = scopeCSS(original, scopeSelector);
         styleTag.textContent = scoped;
@@ -113,133 +109,6 @@ function processMessageCSS(mesElement) {
     });
 }
 
-// ============================================================
-//  JS Sandbox
-//  將 ```js-render 程式碼塊在 sandboxed iframe 中執行
-// ============================================================
-function createSandboxHTML(jsCode, width = '100%', height = 'auto') {
-    // iframe 內部的完整 HTML
-    // 提供 root 元素和基本樣式
-    return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  *, *::before, *::after { box-sizing: border-box; }
-  html, body {
-    margin: 0; padding: 0;
-    background: transparent;
-    color: inherit;
-    font-family: inherit;
-    overflow: hidden;
-  }
-  #root {
-    width: 100%;
-    min-height: 20px;
-  }
-</style>
-</head>
-<body>
-<div id="root"></div>
-<script>
-(function() {
-  const root = document.getElementById('root');
-
-  // 自動回報高度給父頁面
-  function reportHeight() {
-    const h = document.body.scrollHeight || document.documentElement.scrollHeight;
-    window.parent.postMessage({ type: 'cr-resize', height: h }, '*');
-  }
-  const resizeObserver = new ResizeObserver(reportHeight);
-  resizeObserver.observe(document.body);
-
-  // 錯誤處理
-  window.onerror = function(msg, src, line, col, err) {
-    const errDiv = document.createElement('div');
-    errDiv.style.cssText = 'color:#ff6b6b;font-size:12px;padding:4px 8px;background:rgba(255,0,0,0.1);border-radius:4px;margin:4px 0;';
-    errDiv.textContent = '⚠ ' + msg + (line ? ' (line ' + line + ')' : '');
-    root.appendChild(errDiv);
-    reportHeight();
-  };
-
-  try {
-    ${jsCode}
-  } catch(e) {
-    const errDiv = document.createElement('div');
-    errDiv.style.cssText = 'color:#ff6b6b;font-size:12px;padding:4px 8px;background:rgba(255,0,0,0.1);border-radius:4px;margin:4px 0;';
-    errDiv.textContent = '⚠ ' + e.message;
-    root.appendChild(errDiv);
-  }
-
-  // 初始回報
-  setTimeout(reportHeight, 50);
-  setTimeout(reportHeight, 300);
-})();
-<\/script>
-</body>
-</html>`;
-}
-
-function processMessageJS(mesElement) {
-    const mesText = mesElement.querySelector('.mes_text');
-    if (!mesText) return;
-
-    // 尋找 language-js-render 的程式碼塊
-    // 在 ST 中 ```js-render 會被渲染為 <pre><code class="language-js-render">
-    const codeBlocks = mesText.querySelectorAll(
-        'code.language-js-render, code.language-render-js, code.language-jsrender'
-    );
-
-    codeBlocks.forEach((codeBlock) => {
-        const pre = codeBlock.closest('pre');
-        if (!pre || pre.dataset.crProcessed) return;
-        pre.dataset.crProcessed = 'true';
-
-        const jsCode = codeBlock.textContent;
-        const html = createSandboxHTML(jsCode);
-        const blob = new Blob([html], { type: 'text/html' });
-        const blobURL = URL.createObjectURL(blob);
-
-        // 建立 iframe 容器
-        const wrapper = document.createElement('div');
-        wrapper.className = 'cr-sandbox-wrapper';
-
-        const iframe = document.createElement('iframe');
-        iframe.src = blobURL;
-        iframe.sandbox = 'allow-scripts'; // 只允許腳本，不允許存取父頁面
-        iframe.className = 'cr-sandbox-iframe';
-        iframe.style.width = '100%';
-        iframe.style.height = '60px'; // 初始高度
-        iframe.style.border = 'none';
-        iframe.style.display = 'block';
-        iframe.setAttribute('loading', 'lazy');
-
-        // 監聽 iframe 的高度回報
-        const resizeHandler = (event) => {
-            if (event.source === iframe.contentWindow && event.data?.type === 'cr-resize') {
-                const newHeight = Math.min(event.data.height + 2, 800); // 最大 800px
-                iframe.style.height = newHeight + 'px';
-            }
-        };
-        window.addEventListener('message', resizeHandler);
-
-        // 清理
-        iframe.addEventListener('load', () => {
-            URL.revokeObjectURL(blobURL);
-        });
-
-        wrapper.appendChild(iframe);
-        pre.replaceWith(wrapper);
-
-        const mesId = mesElement.getAttribute('mesid');
-        log(`Sandboxed JS in message #${mesId}`);
-    });
-}
-
-// ============================================================
-//  也支援 css-render 程式碼塊
-//  ```css-render 的內容會被提取並以 scoped style 注入
-// ============================================================
 function processMessageCSSBlocks(mesElement) {
     const mesText = mesElement.querySelector('.mes_text');
     if (!mesText) return;
@@ -269,7 +138,331 @@ function processMessageCSSBlocks(mesElement) {
 }
 
 // ============================================================
-//  Message Processing — 統一入口
+//  JS Direct DOM Execution（直接操作訊息 DOM，有安全防護）
+//  用於 ```js-render
+// ============================================================
+
+/**
+ * 建立被封鎖的危險 API 清單
+ */
+function createBlockedGlobals() {
+    const blocked = () => {
+        throw new Error('[Chat Renderer] 此 API 在訊息腳本中被禁止使用');
+    };
+    const blockedObj = new Proxy({}, {
+        get: () => blocked,
+        set: () => false,
+    });
+
+    return {
+        // 網路請求
+        fetch: blocked,
+        XMLHttpRequest: blocked,
+        WebSocket: blocked,
+        EventSource: blocked,
+        Request: blocked,
+        Response: blocked,
+        Headers: blocked,
+
+        // 危險的動態執行
+        eval: blocked,
+        Function: blocked,
+        importScripts: blocked,
+
+        // 儲存（防止偷 API key 等）
+        localStorage: blockedObj,
+        sessionStorage: blockedObj,
+        indexedDB: blockedObj,
+        caches: blockedObj,
+
+        // 防止存取 ST 核心
+        SillyTavern: blockedObj,
+        jQuery: blocked,
+        $: blocked,
+
+        // 防止導航 / 存取其他視窗
+        open: blocked,
+        close: blocked,
+        parent: undefined,
+        top: undefined,
+        frames: undefined,
+        opener: undefined,
+    };
+}
+
+/**
+ * 建立限定在 root 內的安全 document 代理
+ */
+function createSafeDocument(root) {
+    return {
+        createElement: (tag) => document.createElement(tag),
+        createTextNode: (text) => document.createTextNode(text),
+        createDocumentFragment: () => document.createDocumentFragment(),
+        createComment: (text) => document.createComment(text),
+        createElementNS: (ns, tag) => document.createElementNS(ns, tag),
+
+        // 查詢限定在 root 內
+        querySelector: (sel) => root.querySelector(sel),
+        querySelectorAll: (sel) => root.querySelectorAll(sel),
+        getElementById: (id) => root.querySelector(`#${CSS.escape(id)}`),
+        getElementsByClassName: (cls) => root.getElementsByClassName(cls),
+        getElementsByTagName: (tag) => root.getElementsByTagName(tag),
+
+        get body() { return root; },
+        get documentElement() { return root; },
+    };
+}
+
+/**
+ * 在訊息 DOM 中直接執行 JS
+ */
+function executeDirectJS(jsCode, mesElement) {
+    const mesText = mesElement.querySelector('.mes_text');
+    if (!mesText) return null;
+
+    const mesId = mesElement.getAttribute('mesid');
+
+    // 建立 root 容器
+    const root = document.createElement('div');
+    root.className = 'cr-direct-root';
+    root.dataset.crMesid = mesId;
+
+    // 安全環境
+    const blockedGlobals = createBlockedGlobals();
+    const safeDoc = createSafeDocument(root);
+
+    // 允許的全域 API（白名單）
+    const allowedGlobals = {
+        console: {
+            log: (...a) => console.log(`[CR #${mesId}]`, ...a),
+            warn: (...a) => console.warn(`[CR #${mesId}]`, ...a),
+            error: (...a) => console.error(`[CR #${mesId}]`, ...a),
+            info: (...a) => console.info(`[CR #${mesId}]`, ...a),
+        },
+
+        // 計時器
+        setTimeout,
+        setInterval,
+        clearTimeout,
+        clearInterval,
+        requestAnimationFrame,
+        cancelAnimationFrame,
+
+        // 基本型別與工具
+        Math, Date, JSON, Number, String, Boolean, Array, Object,
+        Map, Set, WeakMap, WeakSet, Symbol, Promise, RegExp, Proxy,
+        Error, TypeError, RangeError, SyntaxError, ReferenceError, URIError,
+        parseInt, parseFloat, isNaN, isFinite, NaN, Infinity, undefined,
+        encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
+        btoa, atob, structuredClone,
+
+        // Canvas / 繪圖
+        CanvasRenderingContext2D: window.CanvasRenderingContext2D,
+        CanvasGradient: window.CanvasGradient,
+        CanvasPattern: window.CanvasPattern,
+        Path2D: window.Path2D,
+        ImageData: window.ImageData,
+        DOMMatrix: window.DOMMatrix,
+        DOMPoint: window.DOMPoint,
+        DOMRect: window.DOMRect,
+
+        // DOM 相關（安全子集）
+        Element, HTMLElement, Node, NodeList, HTMLCollection: window.HTMLCollection,
+        Event, CustomEvent, MouseEvent, KeyboardEvent,
+        TouchEvent: window.TouchEvent,
+        PointerEvent: window.PointerEvent,
+        AnimationEvent: window.AnimationEvent,
+        TransitionEvent: window.TransitionEvent,
+        MutationObserver, ResizeObserver, IntersectionObserver,
+        CSSStyleDeclaration: window.CSSStyleDeclaration,
+        DOMTokenList: window.DOMTokenList,
+        CSS: window.CSS,
+        getComputedStyle: (el) => window.getComputedStyle(el),
+
+        // 媒體
+        Image, Audio,
+        AudioContext: window.AudioContext,
+
+        // 關鍵：使用者的操作對象
+        root,
+        document: safeDoc,
+    };
+
+    // 合併：blocked 先，allowed 覆蓋
+    const scope = { ...blockedGlobals, ...allowedGlobals };
+
+    // Proxy 攔截所有變數存取
+    const scopeProxy = new Proxy(scope, {
+        has: () => true,
+        get: (target, prop) => {
+            if (prop === Symbol.unscopables) return undefined;
+            if (prop in target) return target[prop];
+            return undefined;
+        },
+        set: (target, prop, value) => {
+            target[prop] = value;
+            return true;
+        },
+    });
+
+    try {
+        const wrappedCode = `
+            "use strict";
+            return (async function(scope) {
+                with(scope) {
+                    ${jsCode}
+                }
+            })
+        `;
+
+        const factory = new Function(wrappedCode)();
+        factory(scopeProxy).catch(err => {
+            showError(root, err.message);
+            console.error(`[CR #${mesId}] Async error:`, err);
+        });
+    } catch (err) {
+        showError(root, err.message);
+        console.error(`[CR #${mesId}] Error:`, err);
+    }
+
+    return root;
+}
+
+function showError(container, message) {
+    const errDiv = document.createElement('div');
+    errDiv.style.cssText = 'color:#ff6b6b;font-size:12px;padding:4px 8px;background:rgba(255,0,0,0.1);border-radius:4px;margin:4px 0;font-family:monospace;';
+    errDiv.textContent = '\u26a0 ' + message;
+    container.appendChild(errDiv);
+}
+
+// ============================================================
+//  JS Iframe Sandbox（完全隔離模式）
+//  用於 ```js-sandbox
+// ============================================================
+function createSandboxHTML(jsCode) {
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: transparent;
+    color: inherit;
+    font-family: inherit;
+    overflow: hidden;
+  }
+  #root { width: 100%; min-height: 20px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function() {
+  const root = document.getElementById('root');
+
+  function reportHeight() {
+    const h = document.body.scrollHeight || document.documentElement.scrollHeight;
+    window.parent.postMessage({ type: 'cr-resize', height: h }, '*');
+  }
+  const ro = new ResizeObserver(reportHeight);
+  ro.observe(document.body);
+
+  window.onerror = function(msg, src, line) {
+    const d = document.createElement('div');
+    d.style.cssText = 'color:#ff6b6b;font-size:12px;padding:4px 8px;background:rgba(255,0,0,0.1);border-radius:4px;margin:4px 0;';
+    d.textContent = '\\u26a0 ' + msg + (line ? ' (line ' + line + ')' : '');
+    root.appendChild(d);
+    reportHeight();
+  };
+
+  try {
+    ${jsCode}
+  } catch(e) {
+    const d = document.createElement('div');
+    d.style.cssText = 'color:#ff6b6b;font-size:12px;padding:4px 8px;background:rgba(255,0,0,0.1);border-radius:4px;margin:4px 0;';
+    d.textContent = '\\u26a0 ' + e.message;
+    root.appendChild(d);
+  }
+
+  setTimeout(reportHeight, 50);
+  setTimeout(reportHeight, 300);
+})();
+<\/script>
+</body>
+</html>`;
+}
+
+function processIframeSandbox(pre, mesElement) {
+    const codeBlock = pre.querySelector('code');
+    const jsCode = codeBlock.textContent;
+    const html = createSandboxHTML(jsCode);
+    const blob = new Blob([html], { type: 'text/html' });
+    const blobURL = URL.createObjectURL(blob);
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'cr-sandbox-wrapper';
+
+    const iframe = document.createElement('iframe');
+    iframe.src = blobURL;
+    iframe.sandbox = 'allow-scripts';
+    iframe.className = 'cr-sandbox-iframe';
+    iframe.style.width = '100%';
+    iframe.style.height = '60px';
+    iframe.style.border = 'none';
+    iframe.style.display = 'block';
+    iframe.setAttribute('loading', 'lazy');
+
+    const resizeHandler = (event) => {
+        if (event.source === iframe.contentWindow && event.data?.type === 'cr-resize') {
+            iframe.style.height = Math.min(event.data.height + 2, 800) + 'px';
+        }
+    };
+    window.addEventListener('message', resizeHandler);
+
+    iframe.addEventListener('load', () => URL.revokeObjectURL(blobURL));
+
+    wrapper.appendChild(iframe);
+    pre.replaceWith(wrapper);
+    log(`Iframe sandboxed JS in message #${mesElement.getAttribute('mesid')}`);
+}
+
+// ============================================================
+//  JS Processing
+// ============================================================
+function processMessageJS(mesElement) {
+    const mesText = mesElement.querySelector('.mes_text');
+    if (!mesText) return;
+
+    // ```js-render → 直接操作 DOM（封鎖危險 API）
+    const directBlocks = mesText.querySelectorAll(
+        'code.language-js-render, code.language-render-js, code.language-jsrender'
+    );
+    directBlocks.forEach((codeBlock) => {
+        const pre = codeBlock.closest('pre');
+        if (!pre || pre.dataset.crProcessed) return;
+        pre.dataset.crProcessed = 'true';
+
+        const jsCode = codeBlock.textContent;
+        const root = executeDirectJS(jsCode, mesElement);
+        if (root) pre.replaceWith(root);
+    });
+
+    // ```js-sandbox → iframe 完全隔離
+    const sandboxBlocks = mesText.querySelectorAll(
+        'code.language-js-sandbox, code.language-sandbox-js, code.language-jssandbox'
+    );
+    sandboxBlocks.forEach((codeBlock) => {
+        const pre = codeBlock.closest('pre');
+        if (!pre || pre.dataset.crProcessed) return;
+        pre.dataset.crProcessed = 'true';
+        processIframeSandbox(pre, mesElement);
+    });
+}
+
+// ============================================================
+//  Message Processing
 // ============================================================
 function processMessage(mesElement) {
     if (!enabled || processedMessages.has(mesElement)) return;
@@ -290,14 +483,13 @@ function processAllMessages() {
 }
 
 // ============================================================
-//  DOM 觀察 — 偵測新訊息
+//  DOM Observer
 // ============================================================
 let observer = null;
 
 function startObserver() {
     const chat = document.getElementById('chat');
     if (!chat) {
-        // chat 容器還沒出現，稍後重試
         setTimeout(startObserver, 1000);
         return;
     }
@@ -306,17 +498,12 @@ function startObserver() {
 
     observer = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
-            // 新增節點
             for (const node of mutation.addedNodes) {
                 if (node.nodeType === Node.ELEMENT_NODE) {
-                    if (node.classList?.contains('mes')) {
-                        processMessage(node);
-                    }
-                    // 也檢查子節點中的 .mes
+                    if (node.classList?.contains('mes')) processMessage(node);
                     node.querySelectorAll?.('.mes')?.forEach(processMessage);
                 }
             }
-            // 內容變更 (如 swipe)
             if (mutation.type === 'childList' && mutation.target.classList?.contains('mes_text')) {
                 const mes = mutation.target.closest('.mes');
                 if (mes) {
@@ -327,13 +514,8 @@ function startObserver() {
         }
     });
 
-    observer.observe(chat, {
-        childList: true,
-        subtree: true,
-    });
-
+    observer.observe(chat, { childList: true, subtree: true });
     log('Observer started');
-    // 處理已存在的訊息
     processAllMessages();
 }
 
@@ -344,10 +526,10 @@ function loadSettings() {
     const stored = localStorage.getItem(`${MODULE_NAME}_settings`);
     if (stored) {
         try {
-            const settings = JSON.parse(stored);
-            enabled = settings.enabled ?? true;
-            enableCSS = settings.enableCSS ?? true;
-            enableJS = settings.enableJS ?? true;
+            const s = JSON.parse(stored);
+            enabled = s.enabled ?? true;
+            enableCSS = s.enableCSS ?? true;
+            enableJS = s.enableJS ?? true;
         } catch (e) { /* ignore */ }
     }
 }
@@ -374,19 +556,23 @@ function createSettingsUI() {
                     </label>
                     <label class="checkbox_label">
                         <input type="checkbox" id="cr_enable_css" ${enableCSS ? 'checked' : ''}>
-                        <span>CSS 渲染（style 標籤自動 scope）</span>
+                        <span>CSS 渲染</span>
                     </label>
                     <label class="checkbox_label">
                         <input type="checkbox" id="cr_enable_js" ${enableJS ? 'checked' : ''}>
-                        <span>JS 沙盒執行（js-render 程式碼塊）</span>
+                        <span>JS 執行</span>
                     </label>
                     <hr>
                     <small class="cr-help-text">
-                        <b>使用方式：</b><br>
-                        CSS → 訊息中的 &lt;style&gt; 標籤會自動限定作用域<br>
-                        CSS → 用 <code>\`\`\`css-render</code> 程式碼塊注入 scoped CSS<br>
-                        JS → 用 <code>\`\`\`js-render</code> 程式碼塊在沙盒中執行<br>
-                        JS 沙盒中可用 <code>root</code> 元素來顯示內容
+                        <b>CSS：</b><br>
+                        &lt;style&gt; 標籤 → 自動 scope 到該訊息<br>
+                        <code>\`\`\`css-render</code> → 注入 scoped CSS<br><br>
+                        <b>JS（兩種模式）：</b><br>
+                        <code>\`\`\`js-render</code> → 操作訊息內 DOM<br>
+                        <small style="opacity:0.7; margin-left:8px;">可加事件監聽、做動畫翻頁等</small><br>
+                        <small style="opacity:0.7; margin-left:8px;">已封鎖 fetch / XHR / localStorage / eval</small><br><br>
+                        <code>\`\`\`js-sandbox</code> → iframe 完全隔離<br>
+                        <small style="opacity:0.7; margin-left:8px;">碰不到頁面，最安全</small>
                     </small>
                 </div>
             </div>
@@ -398,9 +584,7 @@ function createSettingsUI() {
     $('#cr_enabled').on('change', function () {
         enabled = this.checked;
         saveSettings();
-        if (enabled) {
-            processAllMessages();
-        }
+        if (enabled) processAllMessages();
     });
     $('#cr_enable_css').on('change', function () {
         enableCSS = this.checked;
@@ -420,15 +604,12 @@ jQuery(async () => {
     createSettingsUI();
     startObserver();
 
-    // 監聽 ST 的 chat 切換事件
     try {
         const context = SillyTavern.getContext();
         if (context?.eventSource && context?.event_types) {
             context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
                 log('Chat changed, reprocessing...');
-                setTimeout(() => {
-                    processAllMessages();
-                }, 300);
+                setTimeout(processAllMessages, 300);
             });
         }
     } catch (e) {
