@@ -537,19 +537,47 @@ function processMessageJS(mesElement) {
         pre.dataset.crProcessed = 'true';
         processIframeSandbox(pre, mesElement);
     });
+}
 
-    // ```html-render → 完整 HTML 頁面渲染到 iframe
-    // 如果 autoRenderHTML 開啟，也渲染普通的 ```html
-    let htmlSelector = 'code.language-html-render, code.language-render-html, code.language-htmlrender';
+// ============================================================
+//  HTML Processing（獨立於 JS）
+// ============================================================
+function isHTMLContent(text) {
+    const trimmed = text.trim().toLowerCase();
+    return trimmed.startsWith('<!doctype html') ||
+           trimmed.startsWith('<html') ||
+           (trimmed.includes('<head') && trimmed.includes('<body'));
+}
+
+function isHTMLCodeBlock(codeElement) {
+    const cls = codeElement.className || '';
+    // 明確的 html-render 標記
+    if (/language-(html-render|render-html|htmlrender)/i.test(cls)) return true;
+    // autoRenderHTML 開啟時，匹配各種 html class 變體
     if (autoRenderHTML) {
-        htmlSelector += ', code.language-html';
+        // 匹配 language-html, language-markup, hljs + html 等
+        if (/language-html|language-markup/i.test(cls)) return true;
+        if (/\bhtml\b/i.test(cls)) return true;
+        // 沒有特定 language class 但內容是完整 HTML 頁面
+        if (isHTMLContent(codeElement.textContent)) return true;
     }
-    const htmlBlocks = mesText.querySelectorAll(htmlSelector);
-    htmlBlocks.forEach((codeBlock) => {
+    return false;
+}
+
+function processMessageHTML(mesElement) {
+    const mesText = mesElement.querySelector('.mes_text');
+    if (!mesText) return;
+
+    // 掃描所有 pre > code 程式碼塊
+    const allCodeBlocks = mesText.querySelectorAll('pre > code');
+    allCodeBlocks.forEach((codeBlock) => {
         const pre = codeBlock.closest('pre');
         if (!pre || pre.dataset.crProcessed) return;
-        pre.dataset.crProcessed = 'true';
-        processHTMLRender(pre, mesElement);
+
+        if (isHTMLCodeBlock(codeBlock)) {
+            pre.dataset.crProcessed = 'true';
+            processHTMLRender(pre, mesElement);
+        }
     });
 }
 
@@ -557,21 +585,40 @@ function processMessageJS(mesElement) {
 //  Message Processing
 // ============================================================
 function processMessage(mesElement) {
-    if (!enabled || processedMessages.has(mesElement)) return;
-    processedMessages.add(mesElement);
+    if (!enabled) return;
 
-    if (enableCSS) {
-        processMessageCSS(mesElement);
-        processMessageCSSBlocks(mesElement);
+    const isNew = !processedMessages.has(mesElement);
+    if (isNew) {
+        processedMessages.add(mesElement);
+        if (enableCSS) {
+            processMessageCSS(mesElement);
+            processMessageCSSBlocks(mesElement);
+        }
+        if (enableJS) {
+            processMessageJS(mesElement);
+        }
     }
-    if (enableJS) {
-        processMessageJS(mesElement);
-    }
+
+    // HTML 每次都重新掃描（pre.dataset.crProcessed 會防止重複處理）
+    // 這樣可以處理 highlight.js 延遲加 class 的情況
+    processMessageHTML(mesElement);
 }
 
 function processAllMessages() {
     const messages = document.querySelectorAll('#chat .mes');
     messages.forEach(processMessage);
+}
+
+// 延遲重掃 — 等 highlight.js 等工具加完 class 後再試一次
+function scheduleRescan() {
+    setTimeout(() => {
+        const messages = document.querySelectorAll('#chat .mes');
+        messages.forEach(mes => processMessageHTML(mes));
+    }, 500);
+    setTimeout(() => {
+        const messages = document.querySelectorAll('#chat .mes');
+        messages.forEach(mes => processMessageHTML(mes));
+    }, 1500);
 }
 
 // ============================================================
@@ -589,11 +636,19 @@ function startObserver() {
     if (observer) observer.disconnect();
 
     observer = new MutationObserver((mutations) => {
+        let hasNewMessages = false;
         for (const mutation of mutations) {
             for (const node of mutation.addedNodes) {
                 if (node.nodeType === Node.ELEMENT_NODE) {
-                    if (node.classList?.contains('mes')) processMessage(node);
-                    node.querySelectorAll?.('.mes')?.forEach(processMessage);
+                    if (node.classList?.contains('mes')) {
+                        processMessage(node);
+                        hasNewMessages = true;
+                    }
+                    const subMes = node.querySelectorAll?.('.mes');
+                    if (subMes?.length) {
+                        subMes.forEach(processMessage);
+                        hasNewMessages = true;
+                    }
                 }
             }
             if (mutation.type === 'childList' && mutation.target.classList?.contains('mes_text')) {
@@ -601,14 +656,18 @@ function startObserver() {
                 if (mes) {
                     processedMessages.delete(mes);
                     processMessage(mes);
+                    hasNewMessages = true;
                 }
             }
         }
+        // 有新訊息時延遲重掃（等 highlight.js 加完 class）
+        if (hasNewMessages) scheduleRescan();
     });
 
     observer.observe(chat, { childList: true, subtree: true });
     log('Observer started');
     processAllMessages();
+    scheduleRescan();
 }
 
 // ============================================================
@@ -657,7 +716,7 @@ function createSettingsUI() {
                     </label>
                     <label class="checkbox_label">
                         <input type="checkbox" id="cr_auto_html" ${autoRenderHTML ? 'checked' : ''}>
-                        <span>自動渲染 \`\`\`html（不只 html-render）</span>
+                        <span>HTML 渲染</span>
                     </label>
                 </div>
             </div>
@@ -698,7 +757,10 @@ jQuery(async () => {
         if (context?.eventSource && context?.event_types) {
             context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
                 log('Chat changed, reprocessing...');
-                setTimeout(processAllMessages, 300);
+                setTimeout(() => {
+                    processAllMessages();
+                    scheduleRescan();
+                }, 300);
             });
         }
     } catch (e) {
