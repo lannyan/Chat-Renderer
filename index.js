@@ -26,7 +26,8 @@ const processedMessages = new WeakSet();
 let enabled = true;
 let enableCSS = true;
 let enableJS = true;
-let autoRenderHTML = true; // 自動渲染 ```html 程式碼塊
+let autoRenderHTML = true;
+let enableChoices = true; // 劇情選項點擊貼上
 
 // ============================================================
 //  CSS Scoping
@@ -618,6 +619,67 @@ function processMessageHTML(mesElement) {
 }
 
 // ============================================================
+//  Clickable Choices（劇情選項點擊貼上）
+//  只在最後一則 AI 訊息的最後一個 <ol> 生效
+//  點擊後自動貼到 ST 的輸入框
+// ============================================================
+function processAllChoices() {
+    // 先清除所有舊的 choice 狀態
+    document.querySelectorAll('li.cr-choice').forEach((li) => {
+        li.classList.remove('cr-choice', 'cr-choice-selected');
+        li.replaceWith(li.cloneNode(true)); // 移除 event listener
+    });
+
+    if (!enabled || !enableChoices) return;
+
+    // 找最後一則 AI 訊息（不是 user 的 .mes）
+    const allMessages = document.querySelectorAll('#chat .mes:not([is_user="true"])');
+    if (allMessages.length === 0) return;
+    const lastAiMsg = allMessages[allMessages.length - 1];
+
+    const mesText = lastAiMsg.querySelector('.mes_text');
+    if (!mesText) return;
+
+    // 找該訊息裡最後一個 <ol>
+    const allOl = mesText.querySelectorAll('ol');
+    if (allOl.length === 0) return;
+    const lastOl = allOl[allOl.length - 1];
+
+    // 只處理這個 <ol> 裡的 <li>
+    const listItems = lastOl.querySelectorAll('li');
+    if (listItems.length === 0) return;
+
+    lastOl.classList.add('cr-choices-list');
+
+    listItems.forEach((li) => {
+        li.classList.add('cr-choice');
+        li.title = '點擊貼上此選項';
+
+        li.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const choiceText = li.textContent.trim();
+
+            const textarea = document.querySelector('#send_textarea');
+            if (!textarea) {
+                log('Cannot find #send_textarea');
+                return;
+            }
+
+            textarea.value = choiceText;
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
+            textarea.focus();
+
+            li.classList.add('cr-choice-selected');
+            setTimeout(() => li.classList.remove('cr-choice-selected'), 600);
+
+            log(`Choice pasted: ${choiceText.substring(0, 30)}...`);
+        });
+    });
+}
+
+// ============================================================
 //  Message Processing
 // ============================================================
 function processMessage(mesElement) {
@@ -635,14 +697,15 @@ function processMessage(mesElement) {
         }
     }
 
-    // HTML 每次都重新掃描（pre.dataset.crProcessed 會防止重複處理）
-    // 這樣可以處理 highlight.js 延遲加 class 的情況
+    // HTML 每次都重新掃描
     processMessageHTML(mesElement);
+}
 }
 
 function processAllMessages() {
     const messages = document.querySelectorAll('#chat .mes');
     messages.forEach(processMessage);
+    processAllChoices();
 }
 
 // 延遲重掃 — 等 highlight.js 等工具加完 class 後再試一次
@@ -697,7 +760,10 @@ function startObserver() {
             }
         }
         // 有新訊息時延遲重掃（等 highlight.js 加完 class）
-        if (hasNewMessages) scheduleRescan();
+        if (hasNewMessages) {
+            scheduleRescan();
+            processAllChoices();
+        }
     });
 
     observer.observe(chat, { childList: true, subtree: true });
@@ -718,13 +784,14 @@ function loadSettings() {
             enableCSS = s.enableCSS ?? true;
             enableJS = s.enableJS ?? true;
             autoRenderHTML = s.autoRenderHTML ?? true;
+            enableChoices = s.enableChoices ?? true;
         } catch (e) { /* ignore */ }
     }
 }
 
 function saveSettings() {
     localStorage.setItem(`${MODULE_NAME}_settings`, JSON.stringify({
-        enabled, enableCSS, enableJS, autoRenderHTML,
+        enabled, enableCSS, enableJS, autoRenderHTML, enableChoices,
     }));
 }
 
@@ -754,6 +821,10 @@ function createSettingsUI() {
                         <input type="checkbox" id="cr_auto_html" ${autoRenderHTML ? 'checked' : ''}>
                         <span>HTML 渲染</span>
                     </label>
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="cr_choices" ${enableChoices ? 'checked' : ''}>
+                        <span>劇情選項點擊貼上</span>
+                    </label>
                 </div>
             </div>
         </div>
@@ -777,6 +848,11 @@ function createSettingsUI() {
     $('#cr_auto_html').on('change', function () {
         autoRenderHTML = this.checked;
         saveSettings();
+    });
+    $('#cr_choices').on('change', function () {
+        enableChoices = this.checked;
+        saveSettings();
+        processAllChoices();
     });
 }
 

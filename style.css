@@ -1,6 +1,6 @@
 /* Chat Renderer — Extension Styles */
 
-/* Sandbox iframe 容器 */
+/* Sandbox / HTML iframe 容器 */
 .cr-sandbox-wrapper,
 .cr-html-wrapper {
     position: relative;
@@ -19,5 +19,29 @@
     border-radius: 6px;
     background: transparent;
     color-scheme: normal;
+}
+
+/* 劇情選項按鈕 */
+li.cr-choice {
+    cursor: pointer;
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin: 4px 0;
+    transition: all 0.2s ease;
+    border: 1px solid transparent;
+}
+
+li.cr-choice:hover {
+    background: rgba(102, 126, 234, 0.15);
+    border-color: rgba(102, 126, 234, 0.4);
+}
+
+li.cr-choice:active {
+    transform: scale(0.98);
+}
+
+li.cr-choice-selected {
+    background: rgba(102, 126, 234, 0.3) !important;
+    border-color: rgba(102, 126, 234, 0.6) !important;
 }
 
