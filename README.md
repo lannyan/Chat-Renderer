@@ -61,6 +61,9 @@ Found in the Extensions panel under **Chat Renderer**:
 - Does not send any external requests
 - Zero residue on uninstall (just delete the extension folder)
 
+## Credits
+Built with Claude (Anthropic)
+
 ## License
 
 MIT
