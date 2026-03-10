@@ -103,7 +103,7 @@ function processMessageCSS(mesElement) {
 
     styleTags.forEach((styleTag) => {
         if (styleTag.dataset.crScoped) return;
-        if (styleTag.dataset.noScope !== undefined) return;
+        if (styleTag.dataset.Scope === undefined) return;
         const original = styleTag.textContent;
         styleTag.textContent = scoped;
         styleTag.dataset.crScoped = 'true';
