@@ -400,7 +400,7 @@ function processIframeSandbox(pre, mesElement) {
     const codeBlock = pre.querySelector('code');
     const jsCode = codeBlock.textContent;
     const html = createSandboxHTML(jsCode);
-    const blob = new Blob([html], { type: 'text/html' });
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
     const blobURL = URL.createObjectURL(blob);
 
     const wrapper = document.createElement('div');
@@ -511,7 +511,7 @@ function injectResizeReporter(htmlCode) {
 function processHTMLRender(pre, mesElement) {
     const codeBlock = pre.querySelector('code');
     const htmlCode = injectResizeReporter(codeBlock.textContent);
-    const blob = new Blob([htmlCode], { type: 'text/html' });
+    const blob = new Blob([htmlCode], { type: 'text/html;charset=utf-8' });
     const blobURL = URL.createObjectURL(blob);
 
     const wrapper = document.createElement('div');
